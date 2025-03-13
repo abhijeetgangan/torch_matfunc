@@ -1,0 +1,69 @@
+[project]
+name = "torch_matfunc"
+version = "0.0.1"
+description = "Utility matrix functions in PyTorch"
+authors = [
+    { name = "Abhijeet Gangan", email = "flyingicecube42@gmail.com" },
+    { name = "Abhijeet Gangan", email = "abhijeetgangan@g.ucla.edu" },
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "scipy",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "ruff",
+]
+test = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+include = ["torch_matfunc*"]
+
+[tool.ruff]
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".git",
+    ".env",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    "build",
+    "dist",
+    "example",
+]
+
+# Allow lines to be as long as 100 characters.
+line-length = 100
+
+# Target Python 3.10+
+target-version = "py310"
+
+# Move linter settings to the lint section
+[tool.ruff.lint]
+# Enable flake8-bugbear (`B`) rules.
+select = ["E", "F", "B", "I"]
+
+# Allow autofix for all enabled rules (when `--fix` is passed).
+fixable = ["ALL"]
+
+# Sort imports.
+[tool.ruff.lint.isort]
+known-first-party = ["torch_matfunc"]
