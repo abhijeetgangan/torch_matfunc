@@ -92,6 +92,19 @@ class TestPublicMatrixExp:
         A = (0.3 * torch.randn(2, 3, 3, dtype=torch.float64)).requires_grad_()
         assert torch.autograd.gradcheck(matrix_exp, (A,), atol=1e-7, check_forward_ad=True)
 
+    def test_backward_matches_torch_linalg(self):
+        torch.manual_seed(9)
+        A = (0.5 * torch.randn(3, 5, 5, dtype=torch.float64)).requires_grad_()
+        grad = torch.randn(3, 5, 5, dtype=torch.float64)
+        (ours,) = torch.autograd.grad(matrix_exp(A), A, grad)
+        (theirs,) = torch.autograd.grad(torch.linalg.matrix_exp(A), A, grad)
+        torch.testing.assert_close(ours, theirs, **TOL_FP64)
+
+    def test_gradgradcheck(self):
+        torch.manual_seed(10)
+        A = (0.3 * torch.randn(3, 3, dtype=torch.float64)).requires_grad_()
+        assert torch.autograd.gradgradcheck(matrix_exp, (A,), atol=1e-5)
+
     def test_hermitian_gradcheck(self):
         # Exercises the Daleckii-Krein gradients.
         torch.manual_seed(7)
@@ -102,6 +115,24 @@ class TestPublicMatrixExp:
             return matrix_exp(0.5 * (X + X.mH), hermitian=True)
 
         assert torch.autograd.gradcheck(f, (A,), atol=1e-7, check_forward_ad=True)
+
+    def test_vmap_matches_torch_vmap(self):
+        torch.manual_seed(11)
+        A = torch.randn(5, 4, 4, dtype=torch.float64) * 0.5
+        out = torch.vmap(matrix_exp)(A)
+        torch.testing.assert_close(out, torch.vmap(torch.linalg.matrix_exp)(A), **TOL_FP64)
+
+    def test_vmap_of_grad_matches_loop(self):
+        # vmap of grad must keep the per-sample autograd association.
+        torch.manual_seed(12)
+        A = torch.randn(4, 3, 3, dtype=torch.float64) * 0.3
+
+        def f(X):
+            return matrix_exp(X).sum()
+
+        batched = torch.func.vmap(torch.func.grad(f))(A)
+        loop = torch.stack([torch.func.grad(f)(A[i]) for i in range(4)])
+        torch.testing.assert_close(batched, loop, **TOL_FP64)
 
     def test_zero_size(self):
         A = torch.zeros(3, 0, 0, dtype=torch.float64)
@@ -171,3 +202,18 @@ class TestPublicMatrixExpCuda:
         torch.manual_seed(5)
         A = (0.3 * torch.randn(2, 4, 4, dtype=torch.float64, device="cuda")).requires_grad_()
         assert torch.autograd.gradcheck(matrix_exp, (A,), atol=1e-6)
+
+    def test_backward_matches_torch_linalg(self):
+        # The block matrix doubles n, so this backward runs the n=32 Triton kernel.
+        torch.manual_seed(6)
+        A = (0.5 * torch.randn(4, 16, 16, dtype=torch.float64, device="cuda")).requires_grad_()
+        grad = torch.randn(4, 16, 16, dtype=torch.float64, device="cuda")
+        (ours,) = torch.autograd.grad(matrix_exp(A), A, grad)
+        (theirs,) = torch.autograd.grad(torch.linalg.matrix_exp(A), A, grad)
+        torch.testing.assert_close(ours, theirs, **TOL_FP64)
+
+    def test_vmap_through_triton(self):
+        torch.manual_seed(7)
+        A = torch.randn(6, 8, 8, dtype=torch.float64, device="cuda") * 0.5
+        out = torch.vmap(matrix_exp)(A)
+        torch.testing.assert_close(out, torch.vmap(torch.linalg.matrix_exp)(A), **TOL_FP64)
