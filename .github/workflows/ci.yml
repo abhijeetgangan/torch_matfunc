@@ -24,12 +24,12 @@ jobs:
     - name: Install UV
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Install dependencies
       run: |
         uv pip install --system -e ".[dev,test]"
-        uv pip install --system pytest pytest-cov
 
     - name: Lint with Ruff
       run: |
@@ -39,12 +39,7 @@ jobs:
 
     - name: Test with pytest
       run: |
-        pytest --cov=torch_matfunc tests/
-
-    - name: Run tests with coverage
-      run: |
-        pip install pytest-cov
-        pytest --cov=./ --cov-report=xml
+        pytest --cov=torch_matfunc --cov-report=xml tests/
 
     - name: Upload results to Codecov
       uses: codecov/codecov-action@v5

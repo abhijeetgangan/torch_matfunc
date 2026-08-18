@@ -1,66 +1,91 @@
 # torch_matfunc
 
-## A collection of PyTorch matrix functions.
+`matrix_exp` for batches of small matrices: fused Triton kernels on CUDA,
+pure Torch elsewhere. A prototype for
+[`pytorch/pytorch#9983`](https://github.com/pytorch/pytorch/issues/9983).
 
 [![CI](https://github.com/abhijeetgangan/torch_matfunc/actions/workflows/ci.yml/badge.svg)](https://github.com/abhijeetgangan/torch_matfunc/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/abhijeetgangan/torch_matfunc/branch/main/graph/badge.svg)](https://codecov.io/gh/abhijeetgangan/torch_matfunc)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-### Implemented functions
- - `expm_frechet`: Matrix exponential and its Fréchet derivative.
- - `matrix_log_33`: Analytical matrix logarithm for a 3x3 matrix.
+## Features
 
-#### Example Usage
+| Function | Algorithm | Triton | Fallback |
+| --- | --- | --- | --- |
+| `matrix_exp` | Scaling and squaring, degree-18 Taylor | real `n` in `{2,4,8,16,32,64}`, complex `n` in `{2,4,8,16,32}` | pure Torch |
 
-##### Matrix exponential and its Fréchet derivative
+- `torch.linalg`-style API, no SciPy dependency; `hermitian=True` switches to
+  batched `eigh`.
+- Autograd via the block-triangular Frechet identity; the `eigh` path uses
+  Daleckii-Krein gradients, finite at repeated eigenvalues. `torch.func`
+  transforms compose: `grad`, `jacrev`, `jacfwd`, `hessian`, nested `vmap`.
+- `float16` / `bfloat16` computed in `float32` and cast back.
+- `torch.compile`: `fullgraph=True` on Triton-routed sizes, automatic graph
+  break to eager elsewhere.
+
+## Installation
+
+```bash
+pip install -e ".[test]"          # CPU reference + test deps
+pip install -e ".[test,triton]"   # adds the Triton kernels; requires CUDA
+```
+
+## Quick start
 
 ```python
 import torch
-from torch_matfunc.matrix.expm_frechet import expm_frechet
-from scipy.linalg import expm_frechet as scipy_expm_frechet
+from torch_matfunc.linalg import matrix_exp
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dtype = torch.float64
+device = "cuda" if torch.cuda.is_available() else "cpu"
+A = torch.randn(64, 4, 4, dtype=torch.float64, device=device)
 
-A = torch.tensor([[1, 2], [5, 6]], dtype=dtype, device=device)
-E = torch.tensor([[3, 4], [7, 8]], dtype=dtype, device=device)
+E = matrix_exp(A)
+assert torch.allclose(E, torch.linalg.matrix_exp(A), rtol=1e-9, atol=1e-9)
 
-A_numpy = A.cpu().numpy()
-E_numpy = E.cpu().numpy()
-
-# Compute the matrix exponential and its Fréchet derivative
-expm, expm_frechet = expm_frechet(A, E, method="SPS", compute_expm=True)
-expm_scipy, expm_frechet_scipy = scipy_expm_frechet(A_numpy, E_numpy, method="SPS", compute_expm=True)
-
-# Compare with scipy
-assert torch.allclose(expm.cpu(), torch.tensor(expm_scipy))
-assert torch.allclose(expm_frechet.cpu(), torch.tensor(expm_frechet_scipy))
+S = A @ A.mT + 4 * torch.eye(4, dtype=torch.float64, device=device)
+E_h = matrix_exp(S, hermitian=True)  # SPD / Hermitian input: batched eigh
 ```
-#### Matrix exponential and its Fréchet derivative (autograd)
 
-```python
-import torch
-from torch_matfunc.matrix.expm_frechet import expm
-from scipy.linalg import expm_frechet as scipy_expm_frechet
+## Performance
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dtype = torch.float64
+`matrix_exp` vs `torch.linalg.matrix_exp`, fp64, RTX 4070 Laptop; median of 20
+after warmup, with relative error:
 
-A = torch.tensor([[1, 2], [5, 6]], dtype=dtype, device=device, requires_grad=True)
-E = torch.tensor([[3, 4], [7, 8]], dtype=dtype, device=device)
+| batch | n | ours_ms | torch_ms | speedup | rel_err_vs_torch |
+| --- | --- | --- | --- | --- | --- |
+| 256 | 4 | 0.040 | 0.272 | 6.85x | 6.1e-16 |
+| 256 | 8 | 0.053 | 0.287 | 5.39x | 1.3e-15 |
+| 64 | 16 | 0.054 | 0.274 | 5.11x | 2.5e-15 |
+| 64 | 32 | 0.177 | 0.364 | 2.06x | 4.0e-15 |
+| 256 | 64 | 4.833 | 6.521 | 1.35x | 8.4e-15 |
 
-A_numpy = A.cpu().detach().numpy()
-E_numpy = E.cpu().numpy()
+fp32 holds about 6x through n=32; complex128 reaches 15.9x for n<=8.
 
-# Compute the matrix exponential
-expm = expm.apply(A)
+Batch-size scaling, regenerated with `uv run benchmarks/plot_scaling.py`:
 
-# Compute the gradient of the matrix exponential
-expm_frechet = torch.autograd.grad(expm, A, E)[0]
-expm_scipy, expm_frechet_scipy = scipy_expm_frechet(A_numpy, E_numpy, method="SPS", compute_expm=True)
+![fp64 scaling](benchmarks/scaling_fp64.png)
+![fp32 scaling](benchmarks/scaling_fp32.png)
 
-# Compare with scipy
-assert torch.allclose(expm.cpu(), torch.tensor(expm_scipy))
-assert torch.allclose(expm_frechet.cpu(), torch.tensor(expm_frechet_scipy))
+## Design
+
+- One matrix per Triton program, working set in SRAM; per-matrix scaling and
+  squaring counts with no host synchronization.
+- Kernels avoid nested data-dependent control flow and pin `num_stages=1` to
+  sidestep Triton pipeliner miscompiles; the squaring count is clamped per
+  dtype so inf/NaN inputs finish in bounded time.
+- Odd `n` and unsupported sizes use the pure-Torch reference through the same
+  public function, including on CUDA; complex Triton stops at `n=32`; the
+  `n=64` working set exceeds shared memory on consumer GPUs.
+- `jacfwd(jacfwd(f))` silently returns zeros, a PyTorch limitation; use
+  `hessian` or `jacfwd(jacrev)` instead.
+
+## Testing
+
+```bash
+pytest tests/                           # CUDA tests skip without a GPU
+uv run benchmarks/bench_matrix_exp.py   # exp vs torch.linalg.matrix_exp
 ```
+
+## License
+
+MIT
