@@ -1,1 +1,1 @@
-"""Pure-Torch implementation of the matrix exponential; runs on any device."""
+"""Pure-Torch implementations of the matrix exponential and logarithm; they run on any device."""

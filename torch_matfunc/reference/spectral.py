@@ -6,51 +6,78 @@ from torch.autograd import forward_ad as fwAD
 SUPPORTED_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
 
 
-def frechet(w, Q, E: torch.Tensor, conj_gamma: bool) -> torch.Tensor:
-    """Daleckii-Krein derivative Q (Gamma * (Q^H E Q)) Q^H; close eigenvalues use exp(midpoint)."""
+def scalar_fn(kind: str, w: torch.Tensor, dtype) -> torch.Tensor:
+    if dtype.is_complex:
+        w = w.to(dtype)
+    fw = torch.exp(w) if kind == "exp" else torch.log(w)
+    return fw.to(dtype)
+
+
+def eigh_forward(kind: str, A: torch.Tensor):
+    w, Q = torch.linalg.eigh(0.5 * (A + A.mH))
+    if kind == "log":
+        # Zero out rounding-negative eigenvalues of numerically PSD input; keep genuine ones.
+        eps = torch.finfo(w.dtype).eps
+        tol = A.shape[-1] * eps * w.abs().amax(dim=-1, keepdim=True)
+        w = torch.where((w < 0) & (w >= -tol), torch.zeros_like(w), w)
+    return w, Q
+
+
+def frechet(kind: str, w, Q, E: torch.Tensor, conj_gamma: bool) -> torch.Tensor:
+    """Daleckii-Krein derivative Q (Gamma * (Q^H E Q)) Q^H; close eigenvalues use f'(midpoint)."""
     eps = torch.finfo(w.dtype).eps
     wi, wj = w.unsqueeze(-1), w.unsqueeze(-2)
     dw = wi - wj
-    small = dw.abs() <= eps**0.5
-    fw = torch.exp(w.to(E.dtype))
+    # log cancels for relatively close pairs, exp for absolutely close ones.
+    tol = eps**0.5 * torch.maximum(wi.abs(), wj.abs()) if kind == "log" else eps**0.5
+    small = dw.abs() <= tol
+    fw = scalar_fn(kind, w, E.dtype)
     dfw = fw.unsqueeze(-1) - fw.unsqueeze(-2)
     quot = dfw / torch.where(small, torch.ones_like(dw), dw).to(dfw.dtype)
-    deriv = torch.exp((0.5 * (wi + wj)).to(E.dtype))
+    mid = 0.5 * (wi + wj)
+    if E.dtype.is_complex:
+        mid = mid.to(E.dtype)
+    deriv = (torch.exp(mid) if kind == "exp" else 1.0 / mid).to(E.dtype)
     gamma = torch.where(small, deriv, quot)
     if conj_gamma:
         gamma = gamma.conj()
-    return Q @ (gamma * (Q.mH @ E @ Q)) @ Q.mH
+    Et = Q.mH @ E @ Q
+    prod = gamma * Et
+    # gamma is inf on the clamped-zero-eigenvalue block; a zero cotangent must give 0, not NaN.
+    prod = torch.where(Et == 0, torch.zeros_like(prod), prod)
+    return Q @ prod @ Q.mH
 
 
 class HermitianFn(torch.autograd.Function):
-    """``exp((A + A^H)/2)`` via eigh; backward recomputes eigh so higher-order autograd works."""
+    """``f((A + A^H)/2)`` via eigh; backward recomputes eigh so higher-order autograd works."""
 
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(A):
-        w, Q = torch.linalg.eigh(0.5 * (A + A.mH))
-        return Q @ torch.diag_embed(torch.exp(w.to(A.dtype))) @ Q.mH
+    def forward(A, kind):
+        w, Q = eigh_forward(kind, A)
+        return Q @ torch.diag_embed(scalar_fn(kind, w, A.dtype)) @ Q.mH
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        (A,) = inputs
+        A, kind = inputs
+        ctx.kind = kind
         ctx.save_for_backward(A)
         ctx.save_for_forward(A)
 
     @staticmethod
     def backward(ctx, grad):
         (A,) = ctx.saved_tensors
-        w, Q = torch.linalg.eigh(0.5 * (A + A.mH))
+        w, Q = eigh_forward(ctx.kind, A)
         # Wirtinger convention: conjugate Gamma in the VJP.
-        out = frechet(w, Q, grad, conj_gamma=True)
-        return 0.5 * (out + out.mH)
+        out = frechet(ctx.kind, w, Q, grad, conj_gamma=True)
+        return 0.5 * (out + out.mH), None
 
     @staticmethod
-    def jvp(ctx, tangent):
+    def jvp(ctx, tangent, _):
         (A,) = ctx.saved_tensors
-        w, Q = torch.linalg.eigh(0.5 * (A + A.mH))
-        return frechet(w, Q, 0.5 * (tangent + tangent.mH), conj_gamma=False)
+        w, Q = eigh_forward(ctx.kind, A)
+        return frechet(ctx.kind, w, Q, 0.5 * (tangent + tangent.mH), conj_gamma=False)
 
 
 def needs_custom_function(A: torch.Tensor) -> bool:
@@ -72,11 +99,11 @@ def needs_custom_function(A: torch.Tensor) -> bool:
     return fwAD.unpack_dual(t).tangent is not None
 
 
-def hermitian_apply(A: torch.Tensor) -> torch.Tensor:
+def hermitian_apply(kind: str, A: torch.Tensor) -> torch.Tensor:
     if needs_custom_function(A):
-        return HermitianFn.apply(A)
-    w, Q = torch.linalg.eigh(0.5 * (A + A.mH))
-    return Q @ torch.diag_embed(torch.exp(w.to(A.dtype))) @ Q.mH
+        return HermitianFn.apply(A, kind)
+    w, Q = eigh_forward(kind, A)
+    return Q @ torch.diag_embed(scalar_fn(kind, w, A.dtype)) @ Q.mH
 
 
 def apply_eigenfun(A: torch.Tensor, fn) -> torch.Tensor:
