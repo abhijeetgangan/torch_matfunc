@@ -1,15 +1,16 @@
-"""torch.library.triton_op registration for matrix_exp and matrix_log."""
+"""torch.library.triton_op registration for matrix_exp, matrix_sqrt and matrix_log."""
 
 import torch
 
 from torch_matfunc.reference import expm as ref_expm
 from torch_matfunc.reference import logm as ref_logm
+from torch_matfunc.reference import sqrtm as ref_sqrtm
 from torch_matfunc.reference.spectral import needs_custom_function
 
 TRITON_AVAILABLE = False
-EXP_SUPPORTED_N = EXP_SUPPORTED_N_COMPLEX = LOG_SUPPORTED_N = ()
+EXP_SUPPORTED_N = EXP_SUPPORTED_N_COMPLEX = SQRT_SUPPORTED_N = LOG_SUPPORTED_N = ()
 TRITON_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
-triton_matrix_exp = triton_matrix_log = None  # type: ignore
+triton_matrix_exp = triton_matrix_sqrt = triton_matrix_log = None  # type: ignore
 try:
     import triton  # noqa: F401
 
@@ -20,6 +21,8 @@ try:
     from torch_matfunc.triton_kernels.expm import triton_matrix_exp
     from torch_matfunc.triton_kernels.logm import SUPPORTED_N as LOG_SUPPORTED_N
     from torch_matfunc.triton_kernels.logm import triton_matrix_log
+    from torch_matfunc.triton_kernels.sqrtm import SUPPORTED_N as SQRT_SUPPORTED_N
+    from torch_matfunc.triton_kernels.sqrtm import triton_matrix_sqrt
 
     TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover
@@ -31,6 +34,11 @@ def can_use_triton(A: torch.Tensor, sizes: tuple) -> bool:
 
 
 # Measured max Triton-winning batch per (dtype, n); absent dtype = always, absent n = never.
+# Sqrt caps hold on both mild and cond=1e4 input; Newton-Schulz cost grows with conditioning.
+SQRT_TRITON_MAX_B = {
+    torch.float64: {2: 2048, 4: 256, 8: 64},
+    torch.complex128: {2: 32768, 4: 128},
+}
 LOG_TRITON_MAX_B = {
     torch.float64: {2: 4096, 4: 512, 8: 128, 16: 32},
     torch.complex128: {2: 8192, 4: 256},
@@ -51,6 +59,13 @@ def forward_exp(A: torch.Tensor) -> torch.Tensor:
         n = A.shape[-1]
         return triton_matrix_exp(A.reshape(-1, n, n).contiguous()).reshape(A.shape)
     return ref_expm.matrix_exp(A)
+
+
+def forward_sqrt(A: torch.Tensor) -> torch.Tensor:
+    if can_use_triton(A, SQRT_SUPPORTED_N) and triton_wins(A, SQRT_TRITON_MAX_B):
+        n = A.shape[-1]
+        return triton_matrix_sqrt(A.reshape(-1, n, n).contiguous()).reshape(A.shape)
+    return ref_sqrtm.matrix_sqrt(A)
 
 
 def forward_log(A: torch.Tensor) -> torch.Tensor:
@@ -108,6 +123,7 @@ def register(name: str, forward_fn):
 
 
 register("matrix_exp", forward_exp)
+register("matrix_sqrt", forward_sqrt)
 register("matrix_log", forward_log)
 
 
@@ -148,14 +164,17 @@ def frechet_function(op_name: str, class_name: str):
 
 
 MatrixExpFn = frechet_function("matrix_exp", "MatrixExpFn")
+MatrixSqrtFn = frechet_function("matrix_sqrt", "MatrixSqrtFn")
 MatrixLogFn = frechet_function("matrix_log", "MatrixLogFn")
-FRECHET_FNS = {"matrix_exp": MatrixExpFn, "matrix_log": MatrixLogFn}
+FRECHET_FNS = {"matrix_exp": MatrixExpFn, "matrix_sqrt": MatrixSqrtFn, "matrix_log": MatrixLogFn}
 
 
 def routes_to_triton(name: str, A: torch.Tensor) -> bool:
     """Shape/dtype/device-only routing predicate, safe to evaluate at trace time."""
     if name == "matrix_exp":
         return can_use_triton(A, EXP_SUPPORTED_N_COMPLEX if A.is_complex() else EXP_SUPPORTED_N)
+    if name == "matrix_sqrt":
+        return can_use_triton(A, SQRT_SUPPORTED_N) and triton_wins(A, SQRT_TRITON_MAX_B)
     return can_use_triton(A, LOG_SUPPORTED_N) and triton_wins(A, LOG_TRITON_MAX_B)
 
 

@@ -9,13 +9,13 @@ SUPPORTED_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex
 def scalar_fn(kind: str, w: torch.Tensor, dtype) -> torch.Tensor:
     if dtype.is_complex:
         w = w.to(dtype)
-    fw = torch.exp(w) if kind == "exp" else torch.log(w)
+    fw = torch.exp(w) if kind == "exp" else torch.sqrt(w) if kind == "sqrt" else torch.log(w)
     return fw.to(dtype)
 
 
 def eigh_forward(kind: str, A: torch.Tensor):
     w, Q = torch.linalg.eigh(0.5 * (A + A.mH))
-    if kind == "log":
+    if kind in ("sqrt", "log"):
         # Zero out rounding-negative eigenvalues of numerically PSD input; keep genuine ones.
         eps = torch.finfo(w.dtype).eps
         tol = A.shape[-1] * eps * w.abs().amax(dim=-1, keepdim=True)
@@ -26,19 +26,24 @@ def eigh_forward(kind: str, A: torch.Tensor):
 def frechet(kind: str, w, Q, E: torch.Tensor, conj_gamma: bool) -> torch.Tensor:
     """Daleckii-Krein derivative Q (Gamma * (Q^H E Q)) Q^H; close eigenvalues use f'(midpoint)."""
     eps = torch.finfo(w.dtype).eps
-    wi, wj = w.unsqueeze(-1), w.unsqueeze(-2)
-    dw = wi - wj
-    # log cancels for relatively close pairs, exp for absolutely close ones.
-    tol = eps**0.5 * torch.maximum(wi.abs(), wj.abs()) if kind == "log" else eps**0.5
-    small = dw.abs() <= tol
-    fw = scalar_fn(kind, w, E.dtype)
-    dfw = fw.unsqueeze(-1) - fw.unsqueeze(-2)
-    quot = dfw / torch.where(small, torch.ones_like(dw), dw).to(dfw.dtype)
-    mid = 0.5 * (wi + wj)
-    if E.dtype.is_complex:
-        mid = mid.to(E.dtype)
-    deriv = (torch.exp(mid) if kind == "exp" else 1.0 / mid).to(E.dtype)
-    gamma = torch.where(small, deriv, quot)
+    if kind == "sqrt":
+        # The divided difference is exactly 1 / (sqrt(w_i) + sqrt(w_j)), which never cancels.
+        sw = scalar_fn("sqrt", w, E.dtype)
+        gamma = 1.0 / (sw.unsqueeze(-1) + sw.unsqueeze(-2))
+    else:
+        wi, wj = w.unsqueeze(-1), w.unsqueeze(-2)
+        dw = wi - wj
+        # log cancels for relatively close pairs, exp for absolutely close ones.
+        tol = eps**0.5 * torch.maximum(wi.abs(), wj.abs()) if kind == "log" else eps**0.5
+        small = dw.abs() <= tol
+        fw = scalar_fn(kind, w, E.dtype)
+        dfw = fw.unsqueeze(-1) - fw.unsqueeze(-2)
+        quot = dfw / torch.where(small, torch.ones_like(dw), dw).to(dfw.dtype)
+        mid = 0.5 * (wi + wj)
+        if E.dtype.is_complex:
+            mid = mid.to(E.dtype)
+        deriv = (torch.exp(mid) if kind == "exp" else 1.0 / mid).to(E.dtype)
+        gamma = torch.where(small, deriv, quot)
     if conj_gamma:
         gamma = gamma.conj()
     Et = Q.mH @ E @ Q

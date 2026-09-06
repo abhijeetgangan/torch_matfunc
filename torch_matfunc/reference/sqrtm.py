@@ -45,7 +45,7 @@ def matrix_sqrt(
     Z = I.clone()
 
     eps = torch.finfo(A.dtype).eps
-    # Freeze scaling once r < eps^0.25, where g ~ 1; below eps^0.5 exit when r stops halving.
+    # Freeze scaling once r < eps^0.25, where g is near 1; below eps^0.5 exit when r stops halving.
     freeze, stall_gate = eps**0.25, eps**0.5
     prev_r = float("inf")
     scale_on = scaled

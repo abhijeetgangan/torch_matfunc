@@ -45,7 +45,7 @@ PADE_WEIGHTS = (
 
 
 def log1p_pade(E: torch.Tensor) -> torch.Tensor:
-    """m=13 Gauss-Legendre Pade: ``log(I + E) ~= sum_j w_j (I + x_j E)^{-1} E``."""
+    """m=13 Gauss-Legendre Pade approximant of ``log(I + E)``: ``sum_j w_j (I + x_j E)^{-1} E``."""
     n = E.shape[-1]
     I = torch.eye(n, dtype=E.dtype, device=E.device).expand_as(E)
     # The m partial-fraction solves are independent, so run them as one solve batched over m.

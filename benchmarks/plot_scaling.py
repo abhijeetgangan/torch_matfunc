@@ -16,8 +16,9 @@
 # [tool.uv]
 # index-strategy = "unsafe-best-match"
 # ///
-"""Batch-size scaling plots: matrix_exp vs torch.linalg.matrix_exp, and matrix_log vs the
-pure-Torch reference on GPU and on CPU: uv run benchmarks/plot_scaling.py [exp|log|all]"""
+"""Batch-size scaling plots: matrix_exp vs torch.linalg.matrix_exp, and matrix_sqrt or
+matrix_log vs the pure-Torch reference on GPU and on CPU:
+uv run benchmarks/plot_scaling.py [exp|sqrt|log|all]"""
 
 import os
 import pathlib
@@ -32,13 +33,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
-from torch_matfunc.linalg import matrix_exp, matrix_log  # noqa: E402
+from torch_matfunc.linalg import matrix_exp, matrix_log, matrix_sqrt  # noqa: E402
 from torch_matfunc.reference.logm import matrix_log as ref_logm  # noqa: E402
+from torch_matfunc.reference.sqrtm import matrix_sqrt as ref_sqrtm  # noqa: E402
 
 NS = (4, 8, 16, 32, 64)
-NS_LOG = (2, 4, 8, 16, 32)
+NS_REF = (2, 4, 8, 16, 32)
 BS = (8, 32, 128, 512, 2048, 8192)
 OUT_DIR = pathlib.Path(__file__).parent
+# Ops benchmarked against their own pure-Torch reference: public function and reference.
+REF_OPS = {"sqrt": (matrix_sqrt, ref_sqrtm), "log": (matrix_log, ref_logm)}
 
 
 def system_busy():
@@ -113,23 +117,24 @@ def sweep(dtype):
     return rows
 
 
-def sweep_log(dtype):
+def sweep_ref(which, dtype):
+    public, ref = REF_OPS[which]
     rows = {}
-    for n in NS_LOG:
+    for n in NS_REF:
         for B in BS:
-            # The reference's 13-node batched Pade solve overflows 8 GB at this cell.
-            if n == 32 and B == 8192 and dtype is torch.float64:
+            # The log reference's 13-node batched Pade solve overflows 8 GB at this cell.
+            if which == "log" and n == 32 and B == 8192 and dtype is torch.float64:
                 continue
             torch.manual_seed(0)
             A = torch.linalg.matrix_exp(0.4 * torch.randn(B, n, n, dtype=dtype, device="cuda"))
             A = A.contiguous()
             # Baseline is the reference path, so the ratio is the per-cell gain from routing.
-            t_pub, t_ref = bench_pair(lambda A=A: matrix_log(A), lambda A=A: ref_logm(A))
+            t_pub, t_ref = bench_pair(lambda A=A: public(A), lambda A=A: ref(A))
             Ac = A.cpu()
-            t_cpu = bench(lambda Ac=Ac: ref_logm(Ac), warmup=1, iters=3)
+            t_cpu = bench(lambda Ac=Ac: ref(Ac), warmup=1, iters=3)
             rows[(n, B)] = (t_pub, t_ref, t_cpu)
             print(
-                f"log {str(dtype).split('.')[-1]} n={n:3d} B={B:5d} "
+                f"{which} {str(dtype).split('.')[-1]} n={n:3d} B={B:5d} "
                 f"public={t_pub * 1e3:8.3f}ms ref={t_ref * 1e3:8.3f}ms "
                 f"cpu={t_cpu * 1e3:9.3f}ms speedup={t_ref / t_pub:5.2f}x "
                 f"gpu_vs_cpu={t_cpu / t_pub:6.2f}x",
@@ -159,8 +164,8 @@ def plot(ns, rows, path, title, ylabel):
 def main():
     args = [a for a in sys.argv[1:] if a != "--force"]
     which = args[0] if args else "all"
-    if which not in ("exp", "log", "all"):
-        sys.exit(f"usage: {sys.argv[0]} [exp|log|all] [--force]")
+    if which not in ("exp", "sqrt", "log", "all"):
+        sys.exit(f"usage: {sys.argv[0]} [exp|sqrt|log|all] [--force]")
     if "--force" not in sys.argv:
         busy = system_busy()
         if busy:
@@ -175,21 +180,23 @@ def main():
                 f"matrix_exp, {name}",
                 "speedup vs torch.linalg.matrix_exp",
             )
-        if which in ("log", "all"):
-            rows = sweep_log(dtype)
+        for op in REF_OPS:
+            if which not in (op, "all"):
+                continue
+            rows = sweep_ref(op, dtype)
             plot(
-                NS_LOG,
+                NS_REF,
                 rows,
-                OUT_DIR / f"scaling_log_{tag}.png",
-                f"matrix_log, {name}: public op vs reference path",
+                OUT_DIR / f"scaling_{op}_{tag}.png",
+                f"matrix_{op}, {name}: public op vs reference path",
                 "speedup vs reference implementation",
             )
             vs_cpu = {k: (v[0], v[2]) for k, v in rows.items()}
             plot(
-                NS_LOG,
+                NS_REF,
                 vs_cpu,
-                OUT_DIR / f"scaling_log_vs_cpu_{tag}.png",
-                f"matrix_log, {name}: public op vs CPU reference",
+                OUT_DIR / f"scaling_{op}_vs_cpu_{tag}.png",
+                f"matrix_{op}, {name}: public op vs CPU reference",
                 "speedup vs CPU reference",
             )
 

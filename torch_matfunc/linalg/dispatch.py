@@ -1,4 +1,4 @@
-"""Public dispatch for matrix_exp and matrix_log."""
+"""Public dispatch for matrix_exp, matrix_sqrt and matrix_log."""
 
 import torch
 
@@ -33,6 +33,12 @@ def matrix_exp(A: torch.Tensor, *, hermitian: bool = False) -> torch.Tensor:
     """Matrix exponential of batched square matrices: Triton kernels on CUDA at supported
     sizes, a pure-Torch implementation otherwise; hermitian=True uses batched eigh."""
     return dispatch(A, "matrix_exp", hermitian)
+
+
+def matrix_sqrt(A: torch.Tensor, *, hermitian: bool = False) -> torch.Tensor:
+    """Principal square root of batched square matrices; the spectrum must avoid the
+    closed negative real axis. Triton on CUDA where measured faster; hermitian=True uses eigh."""
+    return dispatch(A, "matrix_sqrt", hermitian)
 
 
 def matrix_log(A: torch.Tensor, *, hermitian: bool = False) -> torch.Tensor:

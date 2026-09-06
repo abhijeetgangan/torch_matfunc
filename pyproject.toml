@@ -1,7 +1,7 @@
 [project]
 name = "torch_matfunc"
 version = "0.1.0"
-description = "Triton / pure-Torch matrix exponential and logarithm for PyTorch"
+description = "Triton / pure-Torch matrix functions for PyTorch"
 authors = [
     { name = "Abhijeet Gangan", email = "abhijeetgangan@g.ucla.edu" },
 ]
