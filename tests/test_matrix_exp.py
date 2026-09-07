@@ -2,14 +2,11 @@
 
 import pytest
 import torch
+from helpers import TOL_FP32, TOL_FP64, requires_cuda
 
-from torch_matfunc.linalg import matrix_exp
+from torch_matfunc.linalg import matrix_exp, ops
 from torch_matfunc.reference.expm import matrix_exp as ref_expm
 from torch_matfunc.reference.spectral import apply_eigenfun
-
-# 2x the worst error measured across the suite; badly conditioned tests set looser ones.
-TOL_FP32 = {"rtol": 1e-5, "atol": 5e-6}
-TOL_FP64 = {"rtol": 1e-11, "atol": 1e-12}
 
 dtypes = pytest.mark.parametrize(
     "dtype,tol", [(torch.float32, TOL_FP32), (torch.float64, TOL_FP64)], ids=["fp32", "fp64"]
@@ -68,13 +65,38 @@ class TestPublicMatrixExp:
         out = matrix_exp(A)
         torch.testing.assert_close(out, torch.linalg.matrix_exp(A), **tol)
 
-    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+    @pytest.mark.parametrize("dtype", (torch.complex64, torch.complex128))
+    def test_complex_matches_torch(self, dtype):
+        torch.manual_seed(13)
+        A = 0.25 * torch.randn(4, 4, 4, dtype=dtype)
+        tol = TOL_FP64 if dtype is torch.complex128 else TOL_FP32
+        torch.testing.assert_close(matrix_exp(A), torch.linalg.matrix_exp(A), **tol)
+
+    @pytest.mark.parametrize(
+        "device",
+        (
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=requires_cuda,
+            ),
+        ),
+    )
+    def test_multi_batch_dims(self, device):
+        torch.manual_seed(14)
+        A = 0.5 * torch.randn(2, 3, 4, 4, dtype=torch.float64, device=device)
+        out = matrix_exp(A)
+        assert out.shape == A.shape
+        torch.testing.assert_close(out, torch.linalg.matrix_exp(A), **TOL_FP64)
+
+    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64, torch.complex128))
     def test_hermitian_matches_eigh(self, dtype):
         torch.manual_seed(4)
         B = torch.randn(3, 4, 4, dtype=dtype)
-        A = B @ B.mT + 4 * torch.eye(4, dtype=dtype)
-        expected = apply_eigenfun(A, torch.exp)
-        tight = dtype is torch.float64
+        A = B @ B.mH + 4 * torch.eye(4, dtype=dtype)
+        # eigh returns real eigenvalues; cast back so complex A gets a complex oracle.
+        expected = apply_eigenfun(A, lambda w: torch.exp(w.to(A.dtype)))
+        tight = dtype in (torch.float64, torch.complex128)
         tol = {"rtol": 1e-12, "atol": 1e-12} if tight else {"rtol": 1e-5, "atol": 1e-6}
         torch.testing.assert_close(matrix_exp(A, hermitian=True), expected, **tol)
 
@@ -134,10 +156,11 @@ class TestPublicMatrixExp:
         loop = torch.stack([torch.func.grad(f)(A[i]) for i in range(4)])
         torch.testing.assert_close(batched, loop, **TOL_FP64)
 
-    def test_zero_size(self):
-        A = torch.zeros(3, 0, 0, dtype=torch.float64)
+    @pytest.mark.parametrize("shape", ((3, 0, 0), (0, 4, 4), (2, 0, 3, 3)))
+    def test_zero_size(self, shape):
+        A = torch.zeros(*shape, dtype=torch.float64)
         out = matrix_exp(A)
-        assert out.shape == A.shape
+        assert out.shape == A.shape and out.dtype == A.dtype
 
     def test_nonsquare_raises(self):
         with pytest.raises(ValueError, match="square"):
@@ -154,8 +177,18 @@ class TestPublicMatrixExp:
         compiled = torch.compile(matrix_exp)(A)
         torch.testing.assert_close(compiled, matrix_exp(A), rtol=0.0, atol=0.0)
 
+    def test_native_gate_table(self):
+        # fp64 n=64 below B=16 runs torch.linalg.matrix_exp: the kernel is latency-bound there.
+        def meta(B, n, dtype):
+            return torch.empty(B, n, n, dtype=dtype, device="meta")
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton path")
+        assert not ops.exp_kernel_wins(meta(8, 64, torch.float64))
+        assert ops.exp_kernel_wins(meta(16, 64, torch.float64))
+        assert ops.exp_kernel_wins(meta(8, 32, torch.float64))
+        assert ops.exp_kernel_wins(meta(8, 64, torch.float32))
+
+
+@requires_cuda
 class TestPublicMatrixExpCuda:
     @dtypes
     @pytest.mark.parametrize("n", (2, 4, 8, 16, 32, 64))
@@ -169,7 +202,7 @@ class TestPublicMatrixExpCuda:
             tol["atol"] = 3e-5
         torch.testing.assert_close(out, torch.linalg.matrix_exp(A), **tol)
 
-    @pytest.mark.parametrize("n", (8, 32, 64))
+    @pytest.mark.parametrize("n", (8, 16, 32, 64))
     def test_complex128(self, n):
         # Complex n=64 falls back to the reference.
         torch.manual_seed(2)
@@ -187,6 +220,13 @@ class TestPublicMatrixExpCuda:
     def test_compile_fullgraph_matches_torch(self):
         torch.manual_seed(4)
         A = torch.randn(8, 4, 4, dtype=torch.float64, device="cuda") * 0.5
+        compiled = torch.compile(matrix_exp, fullgraph=True)(A)
+        torch.testing.assert_close(compiled, torch.linalg.matrix_exp(A), **TOL_FP64)
+
+    def test_native_gate_compiles(self):
+        # The gated cell runs a native op, which traces without a graph break.
+        torch.manual_seed(8)
+        A = torch.randn(8, 64, 64, dtype=torch.float64, device="cuda") * 0.5
         compiled = torch.compile(matrix_exp, fullgraph=True)(A)
         torch.testing.assert_close(compiled, torch.linalg.matrix_exp(A), **TOL_FP64)
 
@@ -217,3 +257,26 @@ class TestPublicMatrixExpCuda:
         A = torch.randn(6, 8, 8, dtype=torch.float64, device="cuda") * 0.5
         out = torch.vmap(matrix_exp)(A)
         torch.testing.assert_close(out, torch.vmap(torch.linalg.matrix_exp)(A), **TOL_FP64)
+
+    def test_fp64_n64_kernel(self):
+        # Batch 16 is the smallest fp64 n=64 batch the routing sends to the kernel.
+        torch.manual_seed(9)
+        A = 0.5 * torch.randn(16, 64, 64, dtype=torch.float64, device="cuda")
+        assert ops.exp_kernel_wins(A)
+        torch.testing.assert_close(matrix_exp(A), torch.linalg.matrix_exp(A), **TOL_FP64)
+
+    @pytest.mark.parametrize("scale", (1e-4, 1.0, 8.0))
+    def test_squaring_branches(self, scale):
+        torch.manual_seed(10)
+        A = scale * torch.randn(4, 8, 8, dtype=torch.float64, device="cuda")
+        torch.testing.assert_close(matrix_exp(A), torch.linalg.matrix_exp(A), **TOL_FP64)
+
+    def test_large_batch(self):
+        torch.manual_seed(11)
+        A = 0.5 * torch.randn(1024, 4, 4, dtype=torch.float64, device="cuda")
+        torch.testing.assert_close(matrix_exp(A), torch.linalg.matrix_exp(A), **TOL_FP64)
+
+    def test_zero_input(self):
+        A = torch.zeros(2, 4, 4, dtype=torch.float64, device="cuda")
+        expected = torch.eye(4, dtype=torch.float64, device="cuda").expand(2, 4, 4)
+        torch.testing.assert_close(matrix_exp(A), expected, rtol=0, atol=1e-15)

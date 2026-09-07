@@ -80,7 +80,9 @@ Batch-size scaling, regenerated with `uv run benchmarks/plot_scaling.py [exp|sqr
 
 - One matrix per Triton program, working set in SRAM. `matrix_exp` and
   `matrix_sqrt` finish in a single launch with no host synchronization;
-  `matrix_log` syncs once every four root launches to stop early.
+  `matrix_log` syncs once every four root launches to stop early. fp64
+  `matrix_exp` at n=64 with fewer than 16 matrices runs
+  `torch.linalg.matrix_exp`, where the kernel is latency-bound.
 - `matrix_sqrt` prescales each matrix by its 1-norm on the host, using
   `sqrt(A) = sqrt(c) * sqrt(A / c)`, so the coupled Denman-Beavers iteration
   count does not depend on `||A||`. `matrix_log` runs inverse scaling and

@@ -4,23 +4,16 @@ import math
 
 import pytest
 import torch
+from helpers import TOL_FP32, TOL_FP64, requires_cuda, requires_triton
+from helpers import random_spd as spd
 
 from torch_matfunc.linalg import matrix_log, matrix_sqrt, ops
 from torch_matfunc.reference.spectral import apply_eigenfun
 from torch_matfunc.reference.sqrtm import matrix_sqrt as ref_sqrtm
 
-# 2x the worst error measured across the suite; badly conditioned tests set looser ones.
-TOL_FP32 = {"rtol": 1e-5, "atol": 5e-6}
-TOL_FP64 = {"rtol": 1e-11, "atol": 1e-12}
-
 dtypes = pytest.mark.parametrize(
     "dtype,tol", [(torch.float32, TOL_FP32), (torch.float64, TOL_FP64)], ids=["fp32", "fp64"]
 )
-
-
-def spd(batch, n, dtype=torch.float64, device="cpu"):
-    B = torch.randn(*batch, n, n, dtype=dtype, device=device)
-    return B @ B.mH + n * torch.eye(n, dtype=dtype, device=device)
 
 
 def triangular(batch, n, dtype=torch.float64, device="cpu"):
@@ -114,12 +107,13 @@ class TestPublicMatrixSqrt:
         out = matrix_sqrt(torch.linalg.matrix_exp(B))
         torch.testing.assert_close(out, torch.linalg.matrix_exp(0.5 * B), **tol)
 
-    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64, torch.complex128))
     def test_hermitian_matches_eigh(self, dtype):
         torch.manual_seed(8)
         A = spd((3,), 4, dtype=dtype)
-        expected = apply_eigenfun(A, torch.sqrt)
-        tight = dtype is torch.float64
+        # eigh returns real eigenvalues; cast so the oracle matches the matrix dtype.
+        expected = apply_eigenfun(A, lambda w: torch.sqrt(w.to(A.dtype)))
+        tight = dtype in (torch.float64, torch.complex128)
         tol = {"rtol": 1e-12, "atol": 1e-12} if tight else {"rtol": 1e-5, "atol": 1e-6}
         torch.testing.assert_close(matrix_sqrt(A, hermitian=True), expected, **tol)
 
@@ -200,7 +194,9 @@ class TestPublicMatrixSqrt:
     def test_extreme_scale(self, scale):
         torch.manual_seed(17)
         A = spd((8,), 4) * scale
-        torch.testing.assert_close(matrix_sqrt(A), apply_eigenfun(A, torch.sqrt), **TOL_FP64)
+        S = matrix_sqrt(A)
+        torch.testing.assert_close(S, apply_eigenfun(A, torch.sqrt), **TOL_FP64)
+        assert rel_residual(S, A) < 1e-13
 
     def test_log_of_sqrt_is_half_log(self):
         torch.manual_seed(18)
@@ -213,21 +209,22 @@ class TestPublicMatrixSqrt:
             A = torch.empty(B, n, n, dtype=dtype, device="meta")
             return ops.triton_wins(A, ops.SQRT_TRITON_MAX_B)
 
-        assert wins(2048, 2, torch.float64)
-        assert not wins(2049, 2, torch.float64)
+        assert wins(1024, 2, torch.float64)
+        assert not wins(1025, 2, torch.float64)
         assert wins(256, 4, torch.float64)
         assert not wins(257, 4, torch.float64)
-        assert wins(64, 8, torch.float64)
-        assert not wins(65, 8, torch.float64)
+        assert wins(32, 8, torch.float64)
+        assert not wins(33, 8, torch.float64)
         assert not wins(8, 16, torch.float64)
         assert not wins(8, 32, torch.float64)
         assert wins(100000, 32, torch.float32)
-        assert wins(32768, 2, torch.complex128)
-        assert wins(128, 4, torch.complex128)
-        assert not wins(129, 4, torch.complex128)
+        assert wins(512, 2, torch.complex128)
+        assert not wins(513, 2, torch.complex128)
+        assert wins(64, 4, torch.complex128)
+        assert not wins(65, 4, torch.complex128)
         assert not wins(8, 8, torch.complex128)
 
-    @pytest.mark.parametrize("shape", ((3, 0, 0), (0, 4, 4)))
+    @pytest.mark.parametrize("shape", ((3, 0, 0), (0, 4, 4), (2, 0, 3, 3)))
     def test_zero_size(self, shape):
         A = torch.zeros(*shape, dtype=torch.float64)
         out = matrix_sqrt(A)
@@ -241,6 +238,24 @@ class TestPublicMatrixSqrt:
         with pytest.raises(TypeError, match="supports"):
             matrix_sqrt(torch.zeros(2, 2, dtype=torch.int64))
 
+    @pytest.mark.parametrize(
+        "device",
+        (
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=requires_cuda,
+            ),
+        ),
+    )
+    def test_multi_batch_dims(self, device):
+        # fp64 n=4 with a (2, 3) batch routes to Triton on CUDA.
+        torch.manual_seed(20)
+        A = spd((2, 3), 4, device=device)
+        S = matrix_sqrt(A)
+        assert S.shape == A.shape
+        torch.testing.assert_close(S @ S, A, **TOL_FP64)
+
     def test_cpu_compile_falls_back_to_eager(self):
         # Compile must graph-break to eager on the CPU reference route.
         torch.manual_seed(19)
@@ -249,9 +264,7 @@ class TestPublicMatrixSqrt:
         torch.testing.assert_close(compiled, matrix_sqrt(A), rtol=0.0, atol=0.0)
 
 
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and ops.TRITON_AVAILABLE), reason="CUDA and Triton required"
-)
+@requires_triton
 class TestPublicMatrixSqrtCuda:
     @dtypes
     @pytest.mark.parametrize("n", (2, 4, 8, 16, 32))
@@ -289,11 +302,11 @@ class TestPublicMatrixSqrtCuda:
         torch.testing.assert_close(matrix_sqrt(A), ref_sqrtm(A), **TOL_FP32)
 
     def test_batch_cap_routes_reference(self):
-        # fp64 n=8 Triton wins only through B=64; above the cap the op must run the reference.
+        # fp64 n=8 Triton wins only through B=32; above the cap the op must run the reference.
         torch.manual_seed(4)
-        A = spd((128,), 8, device="cuda")
+        A = spd((64,), 8, device="cuda")
         assert not ops.routes_to_triton("matrix_sqrt", A)
-        assert ops.routes_to_triton("matrix_sqrt", A[:64])
+        assert ops.routes_to_triton("matrix_sqrt", A[:32])
         torch.testing.assert_close(matrix_sqrt(A), ref_sqrtm(A), rtol=0.0, atol=0.0)
 
     def test_singular_leading_block(self):
@@ -308,7 +321,9 @@ class TestPublicMatrixSqrtCuda:
     def test_extreme_scale_through_triton(self, scale):
         torch.manual_seed(5)
         A = spd((8,), 4, device="cuda") * scale
-        torch.testing.assert_close(matrix_sqrt(A), apply_eigenfun(A, torch.sqrt), **TOL_FP64)
+        S = matrix_sqrt(A)
+        torch.testing.assert_close(S, apply_eigenfun(A, torch.sqrt), **TOL_FP64)
+        assert rel_residual(S, A) < 1e-13
 
     @dtypes
     def test_odd_n_routes_reference(self, dtype, tol):
@@ -348,3 +363,44 @@ class TestPublicMatrixSqrtCuda:
         torch.manual_seed(11)
         A = spd((6,), 4, device="cuda")
         torch.testing.assert_close(torch.vmap(matrix_sqrt)(A), matrix_sqrt(A), **TOL_FP64)
+
+    def test_reference_route_fullgraph_raises(self):
+        # fp64 n=32 routes to the reference, whose Python loop cannot be captured whole.
+        torch.manual_seed(12)
+        A = spd((4,), 32, device="cuda")
+        assert not ops.routes_to_triton("matrix_sqrt", A)
+        with pytest.raises(Exception, match="graph_break"):
+            torch.compile(matrix_sqrt, fullgraph=True)(A)
+
+    def test_hermitian_compile_matches_eigh(self):
+        torch.manual_seed(13)
+        A = spd((4,), 4, device="cuda")
+        compiled = torch.compile(lambda X: matrix_sqrt(X, hermitian=True), fullgraph=True)
+        expected = apply_eigenfun(A, torch.sqrt)
+        torch.testing.assert_close(compiled(A), expected, rtol=1e-12, atol=1e-12)
+
+    def test_kernel_large_batch(self):
+        # Dispatch routes B=1024 to the reference; only the launcher sends it to the kernel.
+        torch.manual_seed(14)
+        A = spd((1024,), 4, device="cuda")
+        S = ops.triton_matrix_sqrt(A.contiguous())
+        torch.testing.assert_close(S @ S, A, **TOL_FP64)
+
+    def test_compile_fullgraph_at_cap(self):
+        torch.manual_seed(15)
+        B = ops.SQRT_TRITON_MAX_B[torch.float64][4]
+        A = spd((B,), 4, device="cuda")
+        assert ops.routes_to_triton("matrix_sqrt", A)
+        compiled = torch.compile(matrix_sqrt, fullgraph=True)(A)
+        torch.testing.assert_close(compiled, matrix_sqrt(A), **TOL_FP64)
+
+    def test_ill_conditioned_roundtrip(self):
+        torch.manual_seed(16)
+        A = ill_conditioned((2,), 4, cond=1e3, device="cuda")
+        S = matrix_sqrt(A)
+        torch.testing.assert_close(S @ S, A, **TOL_FP64)
+
+    def test_identity_input(self):
+        # The zero-residual input exercises the kernel's early exit.
+        A = torch.eye(4, dtype=torch.float64, device="cuda").expand(2, 4, 4).contiguous()
+        torch.testing.assert_close(matrix_sqrt(A), A, rtol=0.0, atol=1e-14)

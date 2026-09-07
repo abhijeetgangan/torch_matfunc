@@ -34,14 +34,14 @@ def can_use_triton(A: torch.Tensor, sizes: tuple) -> bool:
 
 
 # Measured max Triton-winning batch per (dtype, n); absent dtype = always, absent n = never.
-# Sqrt caps hold on both mild and cond=1e4 input; Newton-Schulz cost grows with conditioning.
+# Caps hold on mild and cond=1e4 input; Newton-Schulz cost grows with conditioning, LU does not.
 SQRT_TRITON_MAX_B = {
-    torch.float64: {2: 2048, 4: 256, 8: 64},
-    torch.complex128: {2: 32768, 4: 128},
+    torch.float64: {2: 1024, 4: 256, 8: 32},
+    torch.complex128: {2: 512, 4: 64},
 }
 LOG_TRITON_MAX_B = {
-    torch.float64: {2: 4096, 4: 512, 8: 128, 16: 32},
-    torch.complex128: {2: 8192, 4: 256},
+    torch.float64: {2: 2048, 4: 256, 8: 64},
+    torch.complex128: {2: 512, 4: 64},
 }
 
 
@@ -53,11 +53,25 @@ def triton_wins(A: torch.Tensor, max_b: dict) -> bool:
     return cap is not None and A.shape[:-2].numel() <= cap
 
 
+# Measured min Triton-winning batch per (dtype, n); the fp64 n=64 kernel is latency-bound below it.
+EXP_TRITON_MIN_B = {torch.float64: {64: 16}}
+
+
+def exp_kernel_wins(A: torch.Tensor) -> bool:
+    floors = EXP_TRITON_MIN_B.get(A.dtype)
+    if floors is None:
+        return True
+    floor = floors.get(A.shape[-1])
+    return floor is None or A.shape[:-2].numel() >= floor
+
+
 def forward_exp(A: torch.Tensor) -> torch.Tensor:
     sizes = EXP_SUPPORTED_N_COMPLEX if A.is_complex() else EXP_SUPPORTED_N
     if can_use_triton(A, sizes):
-        n = A.shape[-1]
-        return triton_matrix_exp(A.reshape(-1, n, n).contiguous()).reshape(A.shape)
+        if exp_kernel_wins(A):
+            n = A.shape[-1]
+            return triton_matrix_exp(A.reshape(-1, n, n).contiguous()).reshape(A.shape)
+        return torch.linalg.matrix_exp(A)
     return ref_expm.matrix_exp(A)
 
 
@@ -172,16 +186,24 @@ FRECHET_FNS = {"matrix_exp": MatrixExpFn, "matrix_sqrt": MatrixSqrtFn, "matrix_l
 def routes_to_triton(name: str, A: torch.Tensor) -> bool:
     """Shape/dtype/device-only routing predicate, safe to evaluate at trace time."""
     if name == "matrix_exp":
-        return can_use_triton(A, EXP_SUPPORTED_N_COMPLEX if A.is_complex() else EXP_SUPPORTED_N)
+        sizes = EXP_SUPPORTED_N_COMPLEX if A.is_complex() else EXP_SUPPORTED_N
+        return can_use_triton(A, sizes) and exp_kernel_wins(A)
     if name == "matrix_sqrt":
         return can_use_triton(A, SQRT_SUPPORTED_N) and triton_wins(A, SQRT_TRITON_MAX_B)
     return can_use_triton(A, LOG_SUPPORTED_N) and triton_wins(A, LOG_TRITON_MAX_B)
 
 
+def runs_reference(name: str, A: torch.Tensor) -> bool:
+    """True when the op falls through to the pure-Torch loop; gated exp cells run a native op."""
+    if name == "matrix_exp":
+        return not can_use_triton(A, EXP_SUPPORTED_N_COMPLEX if A.is_complex() else EXP_SUPPORTED_N)
+    return not routes_to_triton(name, A)
+
+
 def library_apply(name: str, A: torch.Tensor) -> torch.Tensor:
     if needs_custom_function(A):
         return FRECHET_FNS[name].apply(A)
-    if torch.compiler.is_compiling() and not routes_to_triton(name, A):
+    if torch.compiler.is_compiling() and runs_reference(name, A):
         # The pure-Torch path loops data-dependently, which compile cannot trace; run eager.
         torch._dynamo.graph_break()
     return getattr(torch.ops.torch_matfunc, name)(A)

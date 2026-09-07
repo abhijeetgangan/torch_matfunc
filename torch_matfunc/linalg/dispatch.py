@@ -30,8 +30,9 @@ def dispatch(A: torch.Tensor, name: str, hermitian: bool) -> torch.Tensor:
 
 
 def matrix_exp(A: torch.Tensor, *, hermitian: bool = False) -> torch.Tensor:
-    """Matrix exponential of batched square matrices: Triton kernels on CUDA at supported
-    sizes, a pure-Torch implementation otherwise; hermitian=True uses batched eigh."""
+    """Matrix exponential of batched square matrices: Triton kernels on CUDA where measured
+    faster, torch.linalg.matrix_exp or a pure-Torch implementation otherwise; hermitian=True
+    uses batched eigh."""
     return dispatch(A, "matrix_exp", hermitian)
 
 

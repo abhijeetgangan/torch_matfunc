@@ -3,7 +3,7 @@ Al-Mohy & Higham (2012): square roots until near ``I``, degree-13 Pade, scale by
 
 import torch
 
-from torch_matfunc.reference.spectral import SUPPORTED_DTYPES
+from torch_matfunc.reference.spectral import SUPPORTED_DTYPES, magma_pin
 from torch_matfunc.reference.sqrtm import matrix_sqrt
 
 MAX_SQRT = 24
@@ -52,7 +52,9 @@ def log1p_pade(E: torch.Tensor) -> torch.Tensor:
     shape = (len(PADE_NODES),) + (1,) * E.ndim
     nodes = torch.tensor(PADE_NODES, dtype=E.dtype, device=E.device).view(shape)
     weights = torch.tensor(PADE_WEIGHTS, dtype=E.dtype, device=E.device).view(shape)
-    sols = torch.linalg.solve(I + nodes * E, weights * E)
+    # solve_ex skips solve's hidden info sync; magma_pin fixes the slow n >= 32 dispatch.
+    with magma_pin(E):
+        sols, _ = torch.linalg.solve_ex(I + nodes * E, weights * E)
     return sols.sum(dim=0)
 
 

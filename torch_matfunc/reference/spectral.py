@@ -1,9 +1,28 @@
 """Hermitian fast path via eigh; Daleckii-Krein gradients stay finite at repeated eigenvalues."""
 
+import contextlib
+
 import torch
 from torch.autograd import forward_ad as fwAD
 
 SUPPORTED_DTYPES = (torch.float32, torch.float64, torch.complex64, torch.complex128)
+
+
+@contextlib.contextmanager
+def magma_pin(A: torch.Tensor):
+    """Prefer MAGMA for batched LU work on CUDA fp64 at n >= 32: the default dispatch there
+    pairs a MAGMA factor that hides a device sync with slow cuBLAS batched trsm solves."""
+    use = A.is_cuda and A.dtype is torch.float64 and A.shape[-1] >= 32 and torch.cuda.has_magma
+    if not use:
+        yield
+        return
+    # The preferred backend is process-global state; save and restore around the calls.
+    prev = torch.backends.cuda.preferred_linalg_library()
+    torch.backends.cuda.preferred_linalg_library("magma")
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_linalg_library(prev)
 
 
 def scalar_fn(kind: str, w: torch.Tensor, dtype) -> torch.Tensor:

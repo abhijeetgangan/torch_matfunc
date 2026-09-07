@@ -33,6 +33,7 @@ dev = [
 test = [
     "pytest",
     "pytest-cov",
+    "scipy",
 ]
 
 [tool.setuptools.packages.find]

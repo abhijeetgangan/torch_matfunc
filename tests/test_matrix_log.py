@@ -2,14 +2,11 @@
 
 import pytest
 import torch
+from helpers import TOL_FP32, TOL_FP64, requires_cuda, requires_triton
 
 from torch_matfunc.linalg import matrix_log, ops
 from torch_matfunc.reference.logm import matrix_log as ref_logm
 from torch_matfunc.reference.spectral import apply_eigenfun
-
-# 2x the worst error measured across the suite; badly conditioned tests set looser ones.
-TOL_FP32 = {"rtol": 1e-5, "atol": 5e-6}
-TOL_FP64 = {"rtol": 1e-11, "atol": 1e-12}
 
 dtypes = pytest.mark.parametrize(
     "dtype,tol", [(torch.float32, TOL_FP32), (torch.float64, TOL_FP64)], ids=["fp32", "fp64"]
@@ -79,13 +76,14 @@ class TestPublicMatrixLog:
         out = matrix_log(torch.linalg.matrix_exp(B))
         torch.testing.assert_close(out, B, **tol)
 
-    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64, torch.complex128))
     def test_hermitian_matches_eigh(self, dtype):
         torch.manual_seed(3)
         B = torch.randn(3, 4, 4, dtype=dtype)
-        A = B @ B.mT + 4 * torch.eye(4, dtype=dtype)
-        expected = apply_eigenfun(A, torch.log)
-        tight = dtype is torch.float64
+        A = B @ B.mH + 4 * torch.eye(4, dtype=dtype)
+        # eigh returns real eigenvalues; cast so the oracle matches the matrix dtype.
+        expected = apply_eigenfun(A, lambda w: torch.log(w.to(A.dtype)))
+        tight = dtype in (torch.float64, torch.complex128)
         tol = {"rtol": 1e-12, "atol": 1e-12} if tight else {"rtol": 1e-5, "atol": 1e-6}
         torch.testing.assert_close(matrix_log(A, hermitian=True), expected, **tol)
 
@@ -167,28 +165,51 @@ class TestPublicMatrixLog:
         A = (B @ B.mT + 4 * torch.eye(4, dtype=torch.float64)) * scale
         torch.testing.assert_close(matrix_log(A), apply_eigenfun(A, torch.log), **TOL_FP64)
 
+    @pytest.mark.parametrize(
+        "device",
+        (
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=requires_cuda,
+            ),
+        ),
+    )
+    def test_multi_batch_dims(self, device):
+        # fp64 n=4 with a (2, 3) batch routes to Triton on CUDA.
+        torch.manual_seed(12)
+        B = torch.randn(2, 3, 4, 4, dtype=torch.float64, device=device)
+        A = B @ B.mT + 4 * torch.eye(4, dtype=torch.float64, device=device)
+        L = matrix_log(A)
+        assert L.shape == A.shape
+        torch.testing.assert_close(torch.linalg.matrix_exp(L), A, **TOL_FP64)
+
     def test_triton_batch_caps(self):
         # Pins the measured routing table; absent dtype always wins, absent n never.
         def wins(B, n, dtype):
             A = torch.empty(B, n, n, dtype=dtype, device="meta")
             return ops.triton_wins(A, ops.LOG_TRITON_MAX_B)
 
-        assert wins(128, 8, torch.float64)
-        assert not wins(129, 8, torch.float64)
-        assert wins(32, 16, torch.float64)
+        assert wins(64, 8, torch.float64)
+        assert not wins(65, 8, torch.float64)
+        assert not wins(8, 16, torch.float64)
         assert not wins(8, 32, torch.float64)
-        assert wins(4096, 2, torch.float64)
-        assert not wins(8192, 2, torch.float64)
+        assert wins(2048, 2, torch.float64)
+        assert not wins(2049, 2, torch.float64)
+        assert wins(256, 4, torch.float64)
+        assert not wins(257, 4, torch.float64)
         assert wins(100000, 32, torch.float32)
-        assert wins(8192, 2, torch.complex128)
-        assert wins(256, 4, torch.complex128)
-        assert not wins(257, 4, torch.complex128)
+        assert wins(512, 2, torch.complex128)
+        assert not wins(513, 2, torch.complex128)
+        assert wins(64, 4, torch.complex128)
+        assert not wins(65, 4, torch.complex128)
         assert not wins(8, 8, torch.complex128)
 
-    def test_zero_size(self):
-        A = torch.zeros(3, 0, 0, dtype=torch.float64)
+    @pytest.mark.parametrize("shape", ((3, 0, 0), (0, 4, 4), (2, 0, 3, 3)))
+    def test_zero_size(self, shape):
+        A = torch.zeros(*shape, dtype=torch.float64)
         out = matrix_log(A)
-        assert out.shape == A.shape
+        assert out.shape == A.shape and out.dtype == A.dtype
 
     def test_nonsquare_raises(self):
         with pytest.raises(ValueError, match="square"):
@@ -205,9 +226,7 @@ class TestPublicMatrixLog:
         torch.testing.assert_close(compiled, matrix_log(A), rtol=0.0, atol=0.0)
 
 
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and ops.TRITON_AVAILABLE), reason="CUDA and Triton required"
-)
+@requires_triton
 class TestPublicMatrixLogCuda:
     @dtypes
     @pytest.mark.parametrize("n", (2, 4, 8, 16, 32))
@@ -251,13 +270,56 @@ class TestPublicMatrixLogCuda:
         torch.testing.assert_close(matrix_log(A), ref_logm(A), rtol=1e-4, atol=2e-5)
 
     def test_batch_cap_routes_reference(self):
-        # fp64 n=8 Triton wins only through B=128; above the cap the op must run the reference.
+        # fp64 n=8 Triton wins only through B=64; above the cap the op must run the reference.
         torch.manual_seed(9)
-        M = 0.4 * torch.randn(256, 8, 8, dtype=torch.float64, device="cuda")
+        M = 0.4 * torch.randn(128, 8, 8, dtype=torch.float64, device="cuda")
         A = torch.linalg.matrix_exp(M)
         assert not ops.routes_to_triton("matrix_log", A)
-        assert ops.routes_to_triton("matrix_log", A[:128])
+        assert ops.routes_to_triton("matrix_log", A[:64])
         torch.testing.assert_close(matrix_log(A), ref_logm(A), rtol=0.0, atol=0.0)
+
+    def test_reference_routing_compiles_to_eager(self):
+        # The forced graph break runs the reference eagerly so results are bitwise identical.
+        torch.manual_seed(11)
+        B = torch.randn(64, 16, 16, dtype=torch.float64, device="cuda")
+        A = B @ B.mT + 16 * torch.eye(16, dtype=torch.float64, device="cuda")
+        assert not ops.routes_to_triton("matrix_log", A)
+        compiled = torch.compile(matrix_log)(A)
+        torch.testing.assert_close(compiled, matrix_log(A), rtol=0.0, atol=0.0)
+
+    def test_kernel_large_batch(self):
+        # Dispatch routes this batch to the reference, so only the launcher exercises the kernel.
+        torch.manual_seed(12)
+        B = torch.randn(1024, 4, 4, dtype=torch.float64, device="cuda")
+        A = B @ B.mT + 4 * torch.eye(4, dtype=torch.float64, device="cuda")
+        L = ops.triton_matrix_log(A.contiguous())
+        torch.testing.assert_close(torch.linalg.matrix_exp(L), A, **TOL_FP64)
+
+    def test_compile_fullgraph_at_cap(self):
+        torch.manual_seed(13)
+        cap = ops.LOG_TRITON_MAX_B[torch.float64][4]
+        B = 0.4 * torch.randn(cap, 4, 4, dtype=torch.float64, device="cuda")
+        A = torch.linalg.matrix_exp(B)
+        assert ops.routes_to_triton("matrix_log", A)
+        compiled = torch.compile(matrix_log, fullgraph=True)(A)
+        torch.testing.assert_close(compiled, matrix_log(A), **TOL_FP64)
+
+    def test_ill_conditioned_roundtrip(self):
+        torch.manual_seed(14)
+        Q, _ = torch.linalg.qr(torch.randn(2, 4, 4, dtype=torch.float64, device="cuda"))
+        d = torch.logspace(-3, 0, 4, dtype=torch.float64, device="cuda")
+        A = Q @ torch.diag_embed(d.expand(2, 4)) @ Q.mT
+        torch.testing.assert_close(torch.linalg.matrix_exp(matrix_log(A)), A, **TOL_FP64)
+
+    def test_n64_routes_reference(self):
+        # Roundtrip error grows with n; measured 4e-11 relative at n=64.
+        torch.manual_seed(15)
+        B = torch.randn(2, 64, 64, dtype=torch.float64, device="cuda")
+        A = B @ B.mT + 64 * torch.eye(64, dtype=torch.float64, device="cuda")
+        assert not ops.routes_to_triton("matrix_log", A)
+        torch.testing.assert_close(
+            torch.linalg.matrix_exp(matrix_log(A)), A, rtol=2e-10, atol=1e-11
+        )
 
     def test_singular_leading_block(self):
         # The 4x4 adjugate inverse must survive a singular top-left 2x2 block.
@@ -310,3 +372,8 @@ class TestPublicMatrixLogCuda:
         A = torch.linalg.matrix_exp(B)
         out = torch.vmap(matrix_log)(A)
         torch.testing.assert_close(out, matrix_log(A), **TOL_FP64)
+
+    def test_identity_input(self):
+        # The zero-residual input exercises the kernel's early exit.
+        A = torch.eye(4, dtype=torch.float64, device="cuda").expand(2, 4, 4).contiguous()
+        torch.testing.assert_close(matrix_log(A), torch.zeros_like(A), rtol=0.0, atol=1e-14)

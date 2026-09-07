@@ -3,7 +3,7 @@
 
 import torch
 
-from torch_matfunc.reference.spectral import SUPPORTED_DTYPES
+from torch_matfunc.reference.spectral import SUPPORTED_DTYPES, magma_pin
 
 
 def matrix_sqrt(
@@ -52,36 +52,42 @@ def matrix_sqrt(
 
     # One batched LU covers both inverses; stacking measured slower past n=16.
     stack_solves = n <= 16
-    for _ in range(max_iters):
-        if stack_solves:
-            YZ = torch.stack([Y, Z])
-            LU, piv = torch.linalg.lu_factor(YZ)
-            invs = torch.linalg.lu_solve(LU, piv, I.expand(YZ.shape))
-            Y_inv, Z_inv = invs[0], invs[1]
-            logdet = LU.diagonal(dim1=-2, dim2=-1).abs().clamp(min=tiny).log().sum(-1).sum(0)
-        else:
-            LUy, pivy = torch.linalg.lu_factor(Y)
-            LUz, pivz = torch.linalg.lu_factor(Z)
-            Y_inv = torch.linalg.lu_solve(LUy, pivy, I)
-            Z_inv = torch.linalg.lu_solve(LUz, pivz, I)
-            logdet = LUy.diagonal(dim1=-2, dim2=-1).abs().clamp(min=tiny).log().sum(
-                -1
-            ) + LUz.diagonal(dim1=-2, dim2=-1).abs().clamp(min=tiny).log().sum(-1)
-        if scale_on:
-            # Determinantal scaling g = |det(Y) det(Z)|^(-1/(2n)), free from the LU diagonals.
-            g = torch.exp((-logdet / (2 * n)).clamp(min=-20.0, max=20.0))[..., None, None]
-            Y, Z = 0.5 * (g * Y + Z_inv / g), 0.5 * (g * Z + Y_inv / g)
-        else:
-            Y, Z = 0.5 * (Y + Z_inv), 0.5 * (Z + Y_inv)
+    with magma_pin(A):
+        for _ in range(max_iters):
+            # lu_factor_ex skips lu_factor's hidden info sync; singular input flows as NaN.
+            if stack_solves:
+                YZ = torch.stack([Y, Z])
+                LU, piv, _ = torch.linalg.lu_factor_ex(YZ)
+                invs = torch.linalg.lu_solve(LU, piv, I.expand(YZ.shape))
+                Y_inv, Z_inv = invs[0], invs[1]
+            else:
+                LUy, pivy, _ = torch.linalg.lu_factor_ex(Y)
+                LUz, pivz, _ = torch.linalg.lu_factor_ex(Z)
+                Y_inv = torch.linalg.lu_solve(LUy, pivy, I)
+                Z_inv = torch.linalg.lu_solve(LUz, pivz, I)
+            if scale_on:
+                # Determinantal scaling g = |det(Y) det(Z)|^(-1/(2n)) from the LU diagonals,
+                # computed only while scaling is live; frozen iterations skip the chain.
+                if stack_solves:
+                    d = LU.diagonal(dim1=-2, dim2=-1).abs().clamp(min=tiny)
+                    logdet = d.log().sum(-1).sum(0)
+                else:
+                    dy = LUy.diagonal(dim1=-2, dim2=-1).abs().clamp(min=tiny)
+                    dz = LUz.diagonal(dim1=-2, dim2=-1).abs().clamp(min=tiny)
+                    logdet = dy.log().sum(-1) + dz.log().sum(-1)
+                g = torch.exp((-logdet / (2 * n)).clamp(min=-20.0, max=20.0))[..., None, None]
+                Y, Z = 0.5 * (g * Y + Z_inv / g), 0.5 * (g * Z + Y_inv / g)
+            else:
+                Y, Z = 0.5 * (Y + Z_inv), 0.5 * (Z + Y_inv)
 
-        # ||As||_F = 1 by construction, so this residual is relative.
-        residual = torch.linalg.matrix_norm(Y @ Y - As, ord="fro")
-        if residual.numel() == 0:
-            break
-        r = float(residual.detach().max())
-        if r < tol or (r < stall_gate and r >= 0.5 * prev_r):
-            break
-        scale_on = scaled and r > freeze
-        prev_r = r
+            # ||As||_F = 1 by construction, so this residual is relative.
+            residual = torch.linalg.matrix_norm(Y @ Y - As, ord="fro")
+            if residual.numel() == 0:
+                break
+            r = float(residual.detach().max())
+            if r < tol or (r < stall_gate and r >= 0.5 * prev_r):
+                break
+            scale_on = scaled and r > freeze
+            prev_r = r
 
     return torch.sqrt(c) * Y
