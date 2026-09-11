@@ -224,10 +224,10 @@ class TestPublicMatrixExpCuda:
         torch.testing.assert_close(compiled, torch.linalg.matrix_exp(A), **TOL_FP64)
 
     def test_native_gate_compiles(self):
-        # The gated cell runs a native op, which traces without a graph break.
+        # Gated cell runs a native op; dynamic shapes hand the gate a SymInt size.
         torch.manual_seed(8)
         A = torch.randn(8, 64, 64, dtype=torch.float64, device="cuda") * 0.5
-        compiled = torch.compile(matrix_exp, fullgraph=True)(A)
+        compiled = torch.compile(matrix_exp, fullgraph=True, dynamic=True)(A)
         torch.testing.assert_close(compiled, torch.linalg.matrix_exp(A), **TOL_FP64)
 
     def test_opcheck(self):

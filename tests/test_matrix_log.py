@@ -301,7 +301,8 @@ class TestPublicMatrixLogCuda:
         B = 0.4 * torch.randn(cap, 4, 4, dtype=torch.float64, device="cuda")
         A = torch.linalg.matrix_exp(B)
         assert ops.routes_to_triton("matrix_log", A)
-        compiled = torch.compile(matrix_log, fullgraph=True)(A)
+        # dynamic=True hands the fp64 routing table a SymInt size.
+        compiled = torch.compile(matrix_log, fullgraph=True, dynamic=True)(A)
         torch.testing.assert_close(compiled, matrix_log(A), **TOL_FP64)
 
     def test_ill_conditioned_roundtrip(self):

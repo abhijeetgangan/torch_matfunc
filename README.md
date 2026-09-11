@@ -10,11 +10,16 @@ fused Triton kernels on CUDA, pure Torch elsewhere. A prototype for
 
 ## Features
 
-| Function | Algorithm | Triton | Fallback |
+| Function | Algorithm | Triton kernel sizes | Fallback |
 | --- | --- | --- | --- |
 | `matrix_exp` | Scaling and squaring, degree-18 Taylor | real `n` in `{2,4,8,16,32,64}`, complex `n` in `{2,4,8,16,32}` | pure Torch |
 | `matrix_sqrt` | Coupled Denman-Beavers with host prescaling | real and complex `n` in `{2,4,8,16,32}` | pure Torch |
 | `matrix_log` | Inverse scaling and squaring, Gauss-Legendre Pade | real and complex `n` in `{2,4,8,16,32}` | pure Torch |
+
+`float32` and `complex64` always take the kernel. `float64` `matrix_sqrt` and
+`matrix_log` take it for `n <= 8` and `complex128` for `n <= 4`, each below a
+measured batch cap kept in `torch_matfunc/linalg/ops.py`, and run pure Torch on
+the GPU elsewhere.
 
 - `torch.linalg`-style API, no SciPy dependency; `hermitian=True` switches to
   batched `eigh`.
@@ -54,8 +59,13 @@ L = matrix_log(P)  # principal log; matrix_exp(L) recovers P
 
 ## Performance
 
-`matrix_exp` vs `torch.linalg.matrix_exp`, fp64, RTX 4070 Laptop; median of 20
-after warmup, with relative error:
+All numbers below: RTX 4070 Laptop GPU with fp64 at 1/64 of the fp32 rate, host
+CPU Intel Core i9-14900HX, torch 2.11.0+cu128, triton 3.6.0. GPU timings are the
+median of 20 calls after warmup, SciPy timings the median of 3 to 5. The fp64
+routing caps are measured on this GPU only.
+
+`matrix_exp` vs `torch.linalg.matrix_exp`, fp64, with relative error
+(`uv run benchmarks/bench_matrix_exp.py`):
 
 | batch | n | ours_ms | torch_ms | speedup | rel_err_vs_torch |
 | --- | --- | --- | --- | --- | --- |
@@ -67,9 +77,25 @@ after warmup, with relative error:
 
 fp32 holds about 6x through n=32; complex128 reaches 15.9x for n<=8.
 
-`matrix_sqrt` and `matrix_log` have no `torch.linalg` counterpart. The public
-functions route each input to Triton or to the pure-Torch reference by dtype, `n`
-and batch count, following measured crossovers kept in `torch_matfunc/linalg/ops.py`.
+`matrix_sqrt` and `matrix_log` have no `torch.linalg` counterpart, so the general
+path on the GPU is compared with SciPy `sqrtm` and `logm` on the CPU, fp64, with
+the largest relative difference from the SciPy result
+(`uv run benchmarks/bench_vs_scipy_and_torch.py`):
+
+| input | batch | n | sqrt vs SciPy | sqrt rel_diff | log vs SciPy | log rel_diff |
+| --- | --- | --- | --- | --- | --- | --- |
+| SPD | 1024 | 8 | 8x | 3.9e-15 | 222x | 3.5e-15 |
+| SPD | 1024 | 32 | 12x | 4.7e-15 | 59x | 1.4e-14 |
+| non-normal | 1024 | 8 | 11x | 3.6e-15 | 523x | 7.3e-15 |
+| non-normal | 1024 | 32 | 14x | 4.8e-15 | 119x | 2.3e-14 |
+
+The public functions route each input to Triton or to the pure-Torch reference by
+dtype, `n` and batch count, following measured crossovers kept in
+`torch_matfunc/linalg/ops.py`. Every fp64 row above runs the batched pure-Torch
+path on the GPU; the fp64 kernels win only for `n <= 8` below the batch caps. On
+SPD input `hermitian=True` is 1.6 to 3.7x faster than the general `matrix_log`
+path and is the right call there; the general `matrix_sqrt` path runs at 0.5 to
+1.9x of `eigh`.
 
 Batch-size scaling, regenerated with `uv run benchmarks/plot_scaling.py [exp|sqrt|log|all]`:
 
@@ -88,8 +114,9 @@ Batch-size scaling, regenerated with `uv run benchmarks/plot_scaling.py [exp|sqr
   count does not depend on `||A||`. `matrix_log` runs inverse scaling and
   squaring as masked square-root launches with per-matrix root counts kept on
   device, then one Pade launch. The in-kernel inverses limit both Triton routes
-  to moderate conditioning, about `1e6` in fp64; `hermitian=True` and the
-  pure-Torch reference do not share this limit.
+  to moderate conditioning; `hermitian=True` and the pure-Torch reference do not
+  share this limit. The routing caps are measured on input with condition number
+  up to `1e4`.
 - Kernels avoid nested data-dependent control flow and pin `num_stages=1` to
   sidestep Triton pipeliner miscompiles; the squaring count is clamped per
   dtype so inf/NaN inputs finish in bounded time.
@@ -106,6 +133,8 @@ Batch-size scaling, regenerated with `uv run benchmarks/plot_scaling.py [exp|sqr
 pytest tests/                           # CUDA tests skip without a GPU
 uv run benchmarks/bench_matrix_exp.py   # exp vs torch.linalg.matrix_exp
 ```
+
+CI runs the CPU suite; the CUDA and Triton tests run locally on a GPU.
 
 ## License
 

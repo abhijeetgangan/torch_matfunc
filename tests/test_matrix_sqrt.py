@@ -342,7 +342,8 @@ class TestPublicMatrixSqrtCuda:
     def test_compile_fullgraph_matches_eager(self):
         torch.manual_seed(8)
         A = spd((8,), 4, device="cuda")
-        compiled = torch.compile(matrix_sqrt, fullgraph=True)(A)
+        # dynamic=True hands the fp64 routing table a SymInt size.
+        compiled = torch.compile(matrix_sqrt, fullgraph=True, dynamic=True)(A)
         torch.testing.assert_close(compiled, matrix_sqrt(A), **TOL_FP64)
 
     def test_opcheck(self):

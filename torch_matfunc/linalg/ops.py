@@ -49,7 +49,8 @@ def triton_wins(A: torch.Tensor, max_b: dict) -> bool:
     caps = max_b.get(A.dtype)
     if caps is None:
         return True
-    cap = caps.get(A.shape[-1])
+    # int() specializes a traced SymInt size, which cannot key a dict.
+    cap = caps.get(int(A.shape[-1]))
     return cap is not None and A.shape[:-2].numel() <= cap
 
 
@@ -61,7 +62,7 @@ def exp_kernel_wins(A: torch.Tensor) -> bool:
     floors = EXP_TRITON_MIN_B.get(A.dtype)
     if floors is None:
         return True
-    floor = floors.get(A.shape[-1])
+    floor = floors.get(int(A.shape[-1]))
     return floor is None or A.shape[:-2].numel() >= floor
 
 
